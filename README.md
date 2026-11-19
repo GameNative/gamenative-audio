@@ -52,16 +52,18 @@ and clamping instead of bailing is what makes the callback the whole device path
 Three properties of the shape matter, and the first is the one that changes behaviour
 underneath libasound:
 
-* **The device's buffer is `burst × 2`, and it grows a burst per lost-audio report.** That is
-  the reference sink's low-latency branch, and the branch GameNative actually runs:
-  `PulseAudioComponent` passes `low_latency=true`, so every sizing decision in
-  `module-aaudio-sink.c` is live. Its own log on this device reads `AAudio buffer size set to
-  384 frames (burst: 192, capacity: 1 536)`. A burst is the route's own unit — how often that
-  HAL wakes — so two of them is a duration the route defined rather than one imposed on it,
-  and the growth rule is what lets a route that needs more reach it without anyone guessing a
-  number. The caller's budget caps it, because the pipeline above holds its backlog out of
-  the same buffer size the app was promised, and a route that needs more than two bursts
-  reaches it through the growth rule rather than through a figure chosen here.
+* **In low-latency mode the device's buffer is `burst × 2`, and it grows a burst per
+  lost-audio report.** That is the reference sink's `low_latency` branch, and the branch
+  GameNative runs when the container's toggle is on: `PulseAudioComponent` passes
+  `low_latency=true`, so every sizing decision in `module-aaudio-sink.c` is live. Its own log
+  on this device reads `AAudio buffer size set to 384 frames (burst: 192, capacity: 1 536)`.
+  A burst is the route's own unit — how often that HAL wakes — so two of them is a duration
+  the route defined rather than one imposed on it, and the growth rule is what lets a route
+  that needs more reach it without anyone guessing a number. The caller's budget caps it,
+  because the pipeline above holds its backlog out of the same buffer size the app was
+  promised. With the mode off — the default, and the setting's unchecked state — nothing is
+  sized and nothing grows: the stream keeps what the route chose for itself, which is what the
+  reference does outside that branch.
 * **The callback does not render.** It hands the period to a render thread and waits for
   it, as `pa_asyncmsgq_send` does. Rendering on AAudio's own thread would put the audio
   pipeline's lateness — a lock, a resample, a ring briefly empty — inside the device's
@@ -260,8 +262,14 @@ that lets those be set by hand only lets them be set wrong.
 * **The render wait** is half the app's period: enough for a late timer tick, short enough
   that it can never delay a period past its own length.
 
-What remains configurable is the capture, and that is a diagnostic rather than a property
-of the audio path: `GNAUDIO_DUMP_SECONDS` (0 disables) and `GNAUDIO_DUMP_PCM` (path).
+One property of the stream is a choice rather than a derivation, because the two answers are
+different products rather than a right one and a wrong one: `GNAUDIO_LOW_LATENCY` (off unless
+set to `1`, `true`, `on` or `yes`) asks for usage `AAUDIO_USAGE_GAME`, a device buffer of two
+bursts and the growth rule above. Left off — the default — the stream opens with the platform's
+default usage and the route's own buffer.
+
+What remains configurable is the capture, and that is a diagnostic rather than a property of
+the audio path: `GNAUDIO_DUMP_SECONDS` (0 disables) and `GNAUDIO_DUMP_PCM` (path).
 
 ## Build and test
 

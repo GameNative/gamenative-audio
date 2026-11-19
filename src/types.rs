@@ -135,6 +135,16 @@ pub struct StreamConfig {
     /// audio route takes every format well: an ordinary app sends 16-bit, and a route that
     /// is clean for it is the reference point this has to match.
     pub format: Option<Format>,
+    /// Whether to ask for this crate's low-latency behaviour, which is the reference sink's
+    /// `low_latency` flag and gates the same three things it gates there: usage
+    /// `AAUDIO_USAGE_GAME`, a device buffer of two bursts, and growing that buffer when the
+    /// device reports it lost audio.
+    ///
+    /// Off by default, and then the stream opens with the platform's default usage and keeps
+    /// whatever buffer the route chose for itself — the reference's behaviour when its flag is
+    /// false, and the shape a caller wants when it would rather have the route's own idea of
+    /// depth than the lowest latency this crate can reach.
+    pub low_latency: bool,
     /// Room to ask the route for before the stream opens, or `None` to take what it
     /// offers. This is the one buffer property that cannot be changed afterwards:
     /// `setBufferSizeInFrames` may only shrink within it.
@@ -157,6 +167,7 @@ impl Default for StreamConfig {
             channels: 2,
             sample_rate: None,
             block_frames: 512,
+            low_latency: false,
             format: None,
             device_buffer_capacity_frames: None,
             device_buffer_frames: None,

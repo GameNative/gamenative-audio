@@ -180,8 +180,12 @@ pub unsafe extern "C" fn gnaudio_open(
             rate => Some(rate),
         },
         block_frames: config.block_frames as u32,
-        // The C surface has no field for this, and does not need one: a caller that wants
-        // room asks AAudio for it through the route's own default.
+        // The C surface has no field to ask for anything else, so it takes the same default
+        // as `StreamConfig` itself.
+        low_latency: false,
+        // The C surface has no fields for these two: a caller that wants a deeper device
+        // buffer asks for it as `device_buffer_frames`, which is a ceiling on what the
+        // backend picks rather than a request made at the route.
         format: None,
         device_buffer_capacity_frames: None,
         device_buffer_frames: match config.device_buffer_frames {

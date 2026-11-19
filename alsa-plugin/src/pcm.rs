@@ -109,6 +109,16 @@ fn ring_frames_for(period: u32, buffer: u32) -> u32 {
 /// hardware it grants `MMAP_PLAYBACK`: no mixer thread between this writer and the DMA
 /// buffer, which is a shorter path and a far less forgiving one. A stream that drops
 /// audio down there has no mixer to hide it and no counter to report it.
+fn low_latency() -> bool {
+    static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        matches!(
+            std::env::var("GNAUDIO_LOW_LATENCY").as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        )
+    })
+}
+
 fn sharing_mode() -> Sharing {
     static MODE: std::sync::OnceLock<Sharing> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("GNAUDIO_SHARING").as_deref() {
@@ -812,29 +822,14 @@ pub unsafe extern "C" fn gnaudio_alsa_hw_params(
         format: None,
         device_buffer_capacity_frames: None,
         block_frames: period,
-        // No deeper than this plugin's own ring can feed.
-        //
-        // The engine writes into the device as fast as the device accepts, and AAudio's
-        // buffer is how far ahead that is: at 3 744 frames it will take seven times this
-        // app's period before it ever blocks. This ring holds at most 1 920, so the moment
-        // the engine catches up — at start, or after any hiccup — it asks for more than the
-        // ring can ever hold and gets silence for the difference. That is the starvation
-        // measured on the paced tone, and it is invisible to a capture of what the app
-        // wrote because nothing the app wrote was missing.
-        //
-        // Asking the device for no more than the ring holds keeps the two in proportion: a
-        // device buffer this size cannot outrun its own feed.
-        // `None` is the backend's own default, which is two device bursts — the shape
-        // PulseAudio's AAudio sink uses, and the one that leaves the pipeline above the
-        // device holding the slack. Asking for a buffer here would charge it against the
-        // buffer size libasound promised the app; `Tune::device_buffer` still exists for
-        // an experiment that needs a specific figure.
-        // A ceiling, not a request: the device may hold at most what the app's buffer
-        // leaves over once the ring has its share. The backend picks within it, using what
-        // the route itself says it needs — which is the whole reason this is not a number
-        // chosen here: a Bluetooth route needs an order of magnitude more buffer than the
-        // built-in speaker, and the same 96-frame burst on both.
+        // A ceiling on the device buffer, not a request. The backend picks within it — two
+        // bursts in low-latency mode, the route's own buffer otherwise — and the reason this
+        // is a ceiling is that a device buffer is charged against the buffer size libasound
+        // promised the app: the engine writes as fast as the device accepts, so a device
+        // buffer deeper than what the app's own buffer leaves over would take its backlog
+        // out of the ring that has to fill the next block.
         device_buffer_frames: Some(buffer_frames.saturating_sub(ring_frames).max(period)),
+        low_latency: low_latency(),
         sharing: sharing_mode(),
         performance: Performance::LowLatency,
     };

@@ -53,6 +53,39 @@ pub fn device_buffer_frames(burst: u32, capacity: u32) -> u32 {
     burst.saturating_mul(2).min(capacity.max(burst))
 }
 
+/// The device buffer to ask for, given what the caller wants and what the route offers.
+///
+/// Four answers, and the caller's intent decides which:
+///
+/// * Room was asked for explicitly — take all of it, because that is what the caller asked.
+/// * Low latency — two bursts, capped by the caller's ceiling, which is the reference sink's
+///   `frames_per_burst * 2` inside its `low_latency` branch.
+/// * Neither — leave the route alone. The reference makes no sizing call outside that branch
+///   and opens with "default buffer size", and AAudio's own choice is per-route: the same
+///   96-frame burst opens at 192 frames on one device and 768 on another.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn device_buffer_target(
+    burst: u32,
+    capacity: u32,
+    route_buffer: u32,
+    low_latency: bool,
+    capacity_asked: bool,
+    ceiling: Option<u32>,
+) -> u32 {
+    let burst = burst.max(1);
+    let mut wanted = if capacity_asked {
+        capacity.max(burst)
+    } else if low_latency {
+        device_buffer_frames(burst, capacity)
+    } else {
+        route_buffer.max(burst)
+    };
+    if let Some(ceiling) = ceiling {
+        wanted = wanted.min(ceiling.max(burst));
+    }
+    wanted
+}
+
 /// How much larger the device buffer should become after the device lost audio.
 ///
 /// One burst at a time, never past what the route can allocate and never past the ceiling
@@ -139,5 +172,48 @@ mod tests {
         assert_eq!(grown_buffer_frames(1_536, 192, 9_999, 1_536), 1_536);
         // A ceiling below the current size never shrinks the buffer.
         assert_eq!(grown_buffer_frames(500, 192, 100, 1_536), 500);
+    }
+
+    #[test]
+    fn the_buffer_follows_the_callers_intent_and_the_routes_own_choice() {
+        // Low latency: two bursts, as the reference's branch sets it.
+        assert_eq!(
+            device_buffer_target(192, 1_536, 1_536, true, false, None),
+            384
+        );
+        // Off: the route's own opening buffer, untouched.
+        assert_eq!(
+            device_buffer_target(192, 1_536, 1_536, false, false, None),
+            1_536
+        );
+        assert_eq!(
+            device_buffer_target(96, 4_608, 768, false, false, None),
+            768
+        );
+        // Room asked for explicitly wins over both.
+        assert_eq!(
+            device_buffer_target(192, 1_536, 1_536, false, true, None),
+            1_536
+        );
+        // The caller's ceiling applies to every answer, and never falls below one burst.
+        assert_eq!(
+            device_buffer_target(192, 1_536, 768, true, false, Some(200)),
+            200
+        );
+        assert_eq!(
+            device_buffer_target(192, 1_536, 1_536, false, false, Some(960)),
+            960
+        );
+        assert_eq!(
+            device_buffer_target(192, 1_536, 1_536, true, false, Some(1)),
+            192
+        );
+    }
+
+    #[test]
+    fn the_default_is_not_low_latency() {
+        // The toggle in the app is off by default, and the engine has to agree with it, or a
+        // caller that passes nothing gets a shape the setting says it did not ask for.
+        assert!(!crate::types::StreamConfig::default().low_latency);
     }
 }

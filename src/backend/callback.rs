@@ -46,7 +46,7 @@ use std::time::Duration;
 
 use super::{Backend, Sink};
 use crate::engine::{block_frames_for, plausible_burst};
-use crate::supply::{bytes_per_sample, device_buffer_frames, grown_buffer_frames, supply_plan};
+use crate::supply::{bytes_per_sample, device_buffer_target, grown_buffer_frames, supply_plan};
 use crate::types::{Error, Events, Format, Granted, Sharing, StreamConfig, Timestamp};
 
 // ---------------------------------------------------------------------------
@@ -246,6 +246,9 @@ struct Shared {
     /// The most the buffer may grow to: what the caller's budget leaves, and the route's own
     /// capacity. Set when the stream is described, because the growth rule runs per period.
     grow_ceiling: AtomicU32,
+    /// Whether the caller asked for low latency. The growth rule belongs to that mode, as it
+    /// does in the reference, so the render thread has to know which mode this stream is in.
+    low_latency: AtomicBool,
     /// When the device last asked for a period. A stream that stops asking while claiming
     /// to play is not playing, and this is the only evidence of it.
     last_request_ns: AtomicU64,
@@ -370,6 +373,7 @@ impl Default for Shared {
             burst: AtomicU32::new(0),
             buffer_frames: AtomicU32::new(0),
             grow_ceiling: AtomicU32::new(0),
+            low_latency: AtomicBool::new(true),
             cadence_ns: AtomicU64::new(0),
             last_request_ns: AtomicU64::new(0),
             last_xruns: AtomicU32::new(0),
@@ -638,11 +642,13 @@ fn build_stream(
         //   if (AAudioStreamBuilder_setUsage && android_get_device_api_level() >= 28)
         //       AAudioStreamBuilder_setUsage(u->builder, AAUDIO_USAGE_GAME);
         //
-        // This crate had never asked for it, so every stream opened as the platform default
-        // `AAUDIO_USAGE_MEDIA`. Usage is what the platform routes on, prioritises on and
-        // ducks on; a game's audio declared as generic media is the one property the
-        // working sink has that this one did not.
-        set_game_usage(builder);
+        // Gated on the caller's low-latency request, exactly as the reference gates it: with
+        // its flag off it never calls `setUsage` either, and the stream keeps the platform
+        // default `AAUDIO_USAGE_MEDIA`. Usage is what the platform routes on, prioritises on
+        // and ducks on, so which of the two a stream carries is worth being able to choose.
+        if config.low_latency {
+            set_game_usage(builder);
+        }
         AAudioStreamBuilder_setFormat(
             builder,
             config.format.unwrap_or(Format::Float32).to_aaudio(),
@@ -702,20 +708,31 @@ fn build_stream(
     // link in the path.
     let route_buffer =
         (unsafe { AAudioStream_getBufferSizeInFrames(stream) }.max(0) as u32).max(burst);
-    // Two bursts, clamped to the route's capacity — the reference sink's low-latency branch,
-    // which is the branch GameNative runs. The caller's budget is a ceiling on top of that,
-    // because the pipeline above holds its backlog out of the same buffer size the app was
-    // promised; an experiment that asks for capacity asks for a deep buffer outright.
-    let mut wanted = match config.device_buffer_capacity_frames {
-        Some(_) => capacity,
-        None => device_buffer_frames(burst, capacity),
+    // Two bursts when the caller wants low latency, the route's own buffer when it does not,
+    // and all of the capacity when it asked for room. The caller's budget is a ceiling on top
+    // of each, because the pipeline above holds its backlog out of the same buffer size the
+    // app was promised.
+    let wanted = device_buffer_target(
+        burst,
+        capacity,
+        route_buffer,
+        config.low_latency,
+        config.device_buffer_capacity_frames.is_some(),
+        config.device_buffer_frames,
+    );
+    // Only called when it would change something: a stream left alone keeps what the route
+    // chose, which is what the reference does outside its low-latency branch.
+    let buffer = if wanted != route_buffer {
+        // SAFETY: the stream is open and nothing is running against it.
+        let applied = unsafe { AAudioStream_setBufferSizeInFrames(stream, wanted as i32) };
+        if applied > 0 {
+            applied as u32
+        } else {
+            wanted
+        }
+    } else {
+        wanted
     };
-    if let Some(ceiling) = config.device_buffer_frames {
-        wanted = wanted.min(ceiling.max(burst));
-    }
-    // SAFETY: the stream is open and nothing is running against it.
-    let applied = unsafe { AAudioStream_setBufferSizeInFrames(stream, wanted as i32) };
-    let buffer = if applied > 0 { applied as u32 } else { wanted };
     let usage = match granted_usage(stream) {
         Some(AAUDIO_USAGE_GAME) => "GAME",
         Some(_) => "not GAME",
@@ -1007,6 +1024,9 @@ fn recreate_stream(request: &RenderRequest, sink: &mut Box<dyn Sink>, mut attemp
                 shared
                     .buffer_frames
                     .store(granted.device_buffer_frames, Ordering::Release);
+                shared
+                    .low_latency
+                    .store(config.low_latency, Ordering::Release);
                 shared.grow_ceiling.store(
                     config
                         .device_buffer_frames
@@ -1119,6 +1139,9 @@ fn report_short_periods(shared: &Shared) {
 /// floor is what makes a route usable and this is the top-up on top of it.
 fn grow_on_xruns(request: &RenderRequest) {
     let shared = &request.shared;
+    if !shared.low_latency.load(Ordering::Acquire) {
+        return;
+    }
     let stream = request.stream.load(Ordering::Acquire);
     if stream.is_null() {
         return;
@@ -1376,6 +1399,9 @@ impl Backend for AaudioBackend {
         self.shared
             .buffer_frames
             .store(granted.device_buffer_frames, Ordering::Release);
+        self.shared
+            .low_latency
+            .store(config.low_latency, Ordering::Release);
         self.shared.grow_ceiling.store(
             config
                 .device_buffer_frames
