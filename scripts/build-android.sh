@@ -7,6 +7,10 @@
 #
 # The NDK is found at $ANDROID_NDK_HOME, or the newest one under the SDK. The API
 # level is the app's own floor: AAudio is API 26, and GameNative's minSdk is 26.
+#
+# Every artifact is linked for a 16 KB page size by `.cargo/config.toml` and then
+# checked by `scripts/check-16kb.sh`, which fails this script rather than letting a
+# library that only loads on 4 KB devices reach `dist/`.
 
 set -eu
 
@@ -45,6 +49,17 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ndk/toolchains/llvm/prebuilt/
 cd "$root"
 echo "=== $target ($abi), API $api, $profile"
 cargo build --target "$target" ${profile_flag:+$profile_flag} --lib --example gn-audio-probe --example gn-audio-rate --example aaudio-direct
+
+# Checked where cargo wrote them, before anything reaches dist/. A published artifact is
+# the one thing a caller trusts, so a 4 KB build must never land there — not even for the
+# moment between a copy and a check that fails afterwards.
+echo
+echo "=== 16 KB page size"
+"$root/scripts/check-16kb.sh" \
+    "target/$target/$profile/libgnaudio.so" \
+    "target/$target/$profile/examples/gn-audio-probe" \
+    "target/$target/$profile/examples/gn-audio-rate" \
+    "target/$target/$profile/examples/aaudio-direct"
 
 mkdir -p "dist/$abi"
 cp "target/$target/$profile/libgnaudio.so" "dist/$abi/"

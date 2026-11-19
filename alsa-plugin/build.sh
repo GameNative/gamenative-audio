@@ -60,8 +60,8 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$cc"
 mkdir -p "$root/build" "$root/prebuilt"
 
 echo "=== link stub, libasound.so.2"
-"$cc" -shared -Wl,-soname,libasound.so.2 -o "$root/prebuilt/libasound.so.2" \
-    "$root/shim/libasound-stub.c"
+"$cc" -shared -Wl,-soname,libasound.so.2 -Wl,-z,max-page-size=16384 \
+    -o "$root/prebuilt/libasound.so.2" "$root/shim/libasound-stub.c"
 
 echo "=== shim, gamenative.o"
 "$cc" -c -O2 -fPIC -DPIC -Wall -Wextra -Werror -I"$root/include" \
@@ -85,19 +85,27 @@ if [ ! -f "$built" ]; then
     exit 1
 fi
 
-mkdir -p "$root/../dist/$abi"
-out="$root/../dist/$abi/libasound_module_pcm_gamenative.so"
-cp "$built" "$out"
-# Stripping is part of the profile, but a link that failed to keep the entry point
-# would still produce a plausible-looking file; check rather than assume.
-if ! "$toolchain/llvm-nm" -D --defined-only "$out" | grep -q "_snd_pcm_gamenative_open"; then
+# Everything below checks what cargo wrote, before it reaches dist/: a published artifact
+# is what a caller trusts, so a bad build must not land there even briefly.
+#
+# Stripping is part of the profile, but a link that failed to keep the entry point would
+# still produce a plausible-looking file; check rather than assume.
+if ! "$toolchain/llvm-nm" -D --defined-only "$built" | grep -q "_snd_pcm_gamenative_open"; then
     echo "the built plugin does not export _snd_pcm_gamenative_open" >&2
     exit 1
 fi
-if ! "$toolchain/llvm-readelf" -d "$out" | grep -q "libasound.so.2"; then
+if ! "$toolchain/llvm-readelf" -d "$built" | grep -q "libasound.so.2"; then
     echo "the built plugin does not depend on libasound.so.2" >&2
     exit 1
 fi
+# A library aligned to 4 KB loads everywhere except a 16 KB device, and nothing about the
+# file looks wrong; the linker flag comes from ../.cargo/config.toml, which this nested
+# crate inherits, and this is what proves it arrived.
+"$root/../scripts/check-16kb.sh" "$built"
+
+mkdir -p "$root/../dist/$abi"
+out="$root/../dist/$abi/libasound_module_pcm_gamenative.so"
+cp "$built" "$out"
 
 echo
 echo "built:"

@@ -284,6 +284,23 @@ Both scripts need only the NDK (`ANDROID_NDK_HOME`, or the newest under the SDK)
 use the NDK's clang as the linker, at API 26 — GameNative's own floor, and AAudio's
 minimum. No `cargo-ndk`. They build arm64-v8a, the one ABI the app ships.
 
+Every artifact is linked for a **16 KB page size**, and both scripts check it before
+anything reaches `dist/`:
+
+```sh
+scripts/check-16kb.sh dist/arm64-v8a
+```
+
+Android 15 shipped devices whose kernel page size is 16 KB, and the dynamic linker maps
+a library's `PT_LOAD` segments at their own `p_align`. A library aligned to 4 KB cannot
+be mapped there at all: `dlopen` fails, and for a Wine unixlib — which Wine loads with
+its own loader while the container starts — the container comes up silent with nothing
+to point at. The flag lives in `.cargo/config.toml` for the target, so the engine's
+library, its examples and the ALSA plugin all get it; the check reads the ELF program
+headers rather than trusting the flag, because a linker that ignores `-z max-page-size`
+still writes a file that looks entirely ordinary. `check-16kb.sh` also rejects
+`TEXTREL`, which no amount of alignment can fix.
+
 ## On a device
 
 The probe is built alongside the library, and runs from a shell on the device:

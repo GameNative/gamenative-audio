@@ -1,0 +1,25 @@
+# Linker flags for the one ABI this project ships.
+#
+# 16 KB pages. Android 15 introduced devices whose kernel page size is 16 KB, and a
+# shared object is only loadable there if its `PT_LOAD` segments are aligned to 16 KB:
+# the dynamic linker maps those segments at `p_align` granularity, so a 4 KB-aligned
+# library cannot be mapped at all and the process fails to start the moment it is
+# `dlopen`ed. The NDK's own linker happens to default to 16 KB from r28 onwards, which
+# is why this project's artifacts have been correct without asking — but "happens to" is
+# not a property of the build. Keeping an older NDK, or a toolchain that keeps the
+# historical 4 KB default, would silently produce a library that works on every device
+# the developer has and fails on the ones that ship with the larger page.
+#
+# `-z max-page-size` is the whole of it: it sets `p_align` on the segments it applies
+# to, and raises the alignment of any section the linker would otherwise place at a
+# finer granularity. `common-page-size` is deliberately left alone — aligning every
+# section to 16 KB pads the file for no benefit, since the requirement is about where
+# segments may be mapped, not about how tightly their contents are packed.
+#
+# Both build paths in this repository go through this file: the engine's own library and
+# its examples (`scripts/build-android.sh`), and the ALSA plugin, which is a nested crate
+# and therefore inherits the same configuration (`alsa-plugin/build.sh`). Each of those
+# scripts then verifies the result rather than trusting the flag, because a linker that
+# ignores it produces a file that looks entirely normal — see `scripts/check-16kb.sh`.
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
