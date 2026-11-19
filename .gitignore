@@ -1,0 +1,27 @@
+# Cargo output, at any depth: the root crate, unixlib/, probe/, alsa-plugin/.
+# Anchoring these per crate means every new crate needs editing here, and forgetting
+# is silent — the build directory gets committed.
+target/
+
+# Built artifacts. Both are produced by scripts/ and belong in a payload, not in
+# the repository.
+dist/
+
+# alsa-plugin/ intermediate output: the C shim's object file, the tone test binary,
+# and the linker wrapper the build uses to inspect its own link line.
+alsa-plugin/build/
+
+# Libraries the plugin links against, none of which may be committed:
+#   libasound.so.2  — the stub build.sh generates from shim/libasound-stub.c
+#   real/           — a copy of the container's own libasound, taken from the image
+#                     to link the tone test against an ABI that matches the device
+alsa-plugin/prebuilt/
+
+.idea
+*.iml
+.vscode/
+
+*.rs.bk
+*.orig
+*.rej
+.staticlib/

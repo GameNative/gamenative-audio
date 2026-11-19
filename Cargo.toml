@@ -1,0 +1,21 @@
+[package]
+name = "gamenative-audio"
+version = "0.1.0"
+edition = "2021"
+description = "Native Android audio engine: direct, low-latency output on AAudio"
+license = "LGPL-2.1-or-later"
+publish = false
+
+[lib]
+name = "gnaudio"
+crate-type = ["cdylib", "rlib"]
+
+[[example]]
+name = "gn-audio-probe"
+
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"

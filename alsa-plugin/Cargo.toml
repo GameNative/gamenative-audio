@@ -1,0 +1,19 @@
+[package]
+name = "gamenative-alsa-plugin"
+version = "0.1.0"
+edition = "2021"
+description = "An ALSA ioplug PCM that plays through the GameNative audio engine"
+license = "LGPL-2.1-or-later"
+publish = false
+
+[lib]
+name = "gamenative_alsa_plugin"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+gnaudio = { package = "gamenative-audio", path = ".." }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"

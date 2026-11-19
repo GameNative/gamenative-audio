@@ -1,0 +1,33 @@
+gamenative-audio — a native Android audio engine for direct, low-latency output,
+on AAudio (through the device's HAL and AudioFlinger).
+
+Copyright (C) 2026 GameNative
+
+Licensed under the GNU Lesser General Public License, version 2.1 or later
+(LGPL-2.1-or-later). The full license text is in COPYING.
+
+LGPL-2.1 requires that anyone who copies, modifies, uses or distributes this code
+or any part of it:
+
+  * keeps this notice and the copyright line above intact in every copy and
+    derivative,
+  * includes the LGPL-2.1 license (COPYING) with any distribution,
+  * makes the library's source available, and states any changes made (with
+    dates), as the license requires.
+
+Provenance: original work, and this project's own implementation throughout. There
+is no third-party code in it and no dependency beyond the platform: the AAudio
+interface in `src/backend/aaudio.rs` is declared by hand against the NDK's own
+header, and the C ABI in `include/gnaudio.h` is this project's own.
+
+One exception, and it is headers rather than code: `alsa-plugin/include/alsa/`
+carries alsa-lib's public headers, which are LGPL-2.1-or-later and unmodified. They
+are vendored so the plugin builds without an external source tree, and they are the
+same license as this project, so the terms above cover them unchanged. The ALSA
+plugin SDK those headers define — the exported entry point's name, and the
+`snd_pcm_ioplug_t` layout libasound fills — is likewise the requester's interface,
+not this project's design.
+
+Where a literal name is required by something that is not ours to rename — an
+interface a host looks up by name, such as libasound's mangled plugin symbol — that
+literal is the requester's, not this project's naming.
