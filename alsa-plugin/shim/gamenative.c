@@ -56,6 +56,8 @@ extern unsigned long long gnaudio_alsa_position(void *pcm);
 extern void gnaudio_alsa_note_depth(void *pcm, unsigned long long depth,
                                     unsigned long long buffer_size);
 extern int gnaudio_alsa_is_open(void *pcm);
+extern int gnaudio_alsa_wait_fd(void *pcm);
+extern int gnaudio_alsa_poll_ready(void *pcm);
 
 static int gamenative_start(snd_pcm_ioplug_t *io) {
     return gnaudio_alsa_start(io->private_data);
@@ -180,6 +182,65 @@ static int gamenative_pause(snd_pcm_ioplug_t *io, int enable) {
 }
 
 /*
+ * Where libasound waits when a write cannot proceed yet.
+ *
+ * This is not optional furniture. `snd_pcm_writei` in blocking mode does not return a
+ * short count when the app offers more frames than `avail` — it waits for room and
+ * retries, inside `snd_pcm_wait_nocheck`. That function polls the descriptors this
+ * plugin names, and an ioplug that names none falls back to the PCM's own `poll_fd`.
+ * The `snd_pcm_ioplug_t` above is `calloc`ed, so that field is zero: libasound polls
+ * file descriptor 0, the process's stdin.
+ *
+ * A wine process's stdin is a pipe whose writer is gone. `poll` reports POLLHUP on such
+ * a pipe immediately, every time, and `snd_pcm_wait_nocheck` only leaves its loop on
+ * POLLIN or POLLOUT — POLLHUP it reads and ignores. The result is a wait that never
+ * returns: measured on an ioplug of exactly this shape, 98 % of one core for as long as
+ * the process lived, with the app's audio thread never coming back out of `writei`.
+ * With stdin at /dev/null the same path instead sleeps out libasound's
+ * one-period-plus-200 ms timeout on every write.
+ *
+ * So the plugin supplies a descriptor of its own and the engine signals it when a pull
+ * frees room. `POLLOUT` is reported only when that has happened, because reporting it
+ * on any other basis puts libasound straight back into a retry loop: it re-reads
+ * `avail`, finds nothing, and waits again.
+ */
+static int gamenative_poll_descriptors_count(snd_pcm_ioplug_t *io) {
+    return gnaudio_alsa_wait_fd(io->private_data) >= 0 ? 1 : 0;
+}
+
+static int gamenative_poll_descriptors(snd_pcm_ioplug_t *io, struct pollfd *pfds,
+                                       unsigned int space) {
+    int fd = gnaudio_alsa_wait_fd(io->private_data);
+    if (fd < 0) {
+        return 0;
+    }
+    if (space < 1 || !pfds) {
+        return -ENOMEM;
+    }
+    pfds->fd = fd;
+    pfds->events = POLLIN;
+    pfds->revents = 0;
+    return 1;
+}
+
+static int gamenative_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfds, unsigned int nfds,
+                                   unsigned short *revents) {
+    *revents = 0;
+    if (!pfds || nfds < 1 || pfds->fd < 0) {
+        return 0;
+    }
+    if (pfds->revents & POLLNVAL) {
+        /* The descriptor is gone: say so rather than report a wakeup that is not one. */
+        *revents = POLLERR;
+        return 0;
+    }
+    if (gnaudio_alsa_poll_ready(io->private_data)) {
+        *revents = POLLOUT;
+    }
+    return 0;
+}
+
+/*
  * Deliberately no `.delay` callback.
  *
  * libasound derives the delay from `appl_ptr - hw_ptr` when the plugin does not
@@ -205,6 +266,9 @@ static const snd_pcm_ioplug_callback_t gamenative_callback = {
     .prepare = gamenative_prepare,
     .drain = gamenative_drain,
     .pause = gamenative_pause,
+    .poll_descriptors_count = gamenative_poll_descriptors_count,
+    .poll_descriptors = gamenative_poll_descriptors,
+    .poll_revents = gamenative_poll_revents,
 };
 
 /*
@@ -278,6 +342,12 @@ static int gamenative_create(snd_pcm_t **pcmp, const char *name, snd_pcm_stream_
     io->name = "GameNative Audio";
     io->callback = &gamenative_callback;
     io->mmap_rw = 0;
+    /* No state to poll on the PCM itself. Left at zero — what `calloc` gives — this is
+     * descriptor 0, and libasound would poll stdin as though it were an audio wakeup
+     * source; the callbacks above are what it uses instead, and -1 here means the
+     * fallback path fails loudly rather than polling something unrelated. */
+    io->poll_fd = -1;
+    io->poll_events = 0;
 
     io->private_data = gnaudio_alsa_create();
     if (!io->private_data) {

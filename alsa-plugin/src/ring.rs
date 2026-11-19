@@ -23,23 +23,110 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-/// Starvation bookkeeping: how often the ring had less than the engine asked for.
+/// Starvation bookkeeping for one stream: how often the ring had less than the
+/// engine asked for.
 ///
 /// This is the one measurement that distinguishes "the plugin crackles" from "the
 /// device crackles": when the ring is empty the engine plays zeros, and a listener
 /// hears that as crackle or dropouts with no error anywhere — libasound is satisfied,
 /// because the read position keeps advancing. Counted on the audio thread (two atomic
 /// adds, no formatting, no locks) and reported from the write path.
-static STARVATIONS: AtomicU64 = AtomicU64::new(0);
-static STARVED_FRAMES: AtomicU64 = AtomicU64::new(0);
-static LOW_WATER_FRAMES: AtomicU64 = AtomicU64::new(u64::MAX);
-/// When the first and last starvation happened, in nanoseconds on the same clock the
-/// plugin uses elsewhere. A total says how much silence there was; when it happened says
-/// whether it is a startup transient or a steady defect, and the two have nothing in
-/// common — the first is the device filling its buffer, the second is the writer failing.
-static FIRST_STARVATION_NS: AtomicU64 = AtomicU64::new(0);
-static LAST_STARVATION_NS: AtomicU64 = AtomicU64::new(0);
-static OPENED_NS: AtomicU64 = AtomicU64::new(0);
+///
+/// Owning this per stream rather than in process-wide statics is what makes more than
+/// one PCM readable. GameNative opens several: a game's music and its voice stream are
+/// separate `IAudioClient`s, and winealsa opens one PCM for each. As globals, the
+/// counts of every open stream landed in the same bucket, so a summary could report
+/// another stream's starvation and — worse — one PCM opening reset the window of a
+/// stream that was already playing.
+pub(crate) struct Starved {
+    count: AtomicU64,
+    frames: AtomicU64,
+    low_water: AtomicU64,
+    /// When the first and last starvation happened, in nanoseconds on the same clock
+    /// the plugin uses elsewhere. A total says how much silence there was; when it
+    /// happened says whether it is a startup transient or a steady defect, and the two
+    /// have nothing in common — the first is the device filling its buffer, the second
+    /// is the writer failing.
+    first_ns: AtomicU64,
+    last_ns: AtomicU64,
+    opened_ns: AtomicU64,
+}
+
+impl Starved {
+    pub(crate) fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            frames: AtomicU64::new(0),
+            low_water: AtomicU64::new(u64::MAX),
+            first_ns: AtomicU64::new(0),
+            last_ns: AtomicU64::new(0),
+            opened_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// Records that the ring came up `frames` short of what was asked for.
+    pub(crate) fn note_starvation(&self, frames: u64) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.frames.fetch_add(frames, Ordering::Relaxed);
+        let now = clock_ns();
+        let _ = self
+            .first_ns
+            .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
+        self.last_ns.store(now, Ordering::Relaxed);
+    }
+
+    /// Marks the moment the stream began, so a starvation can be placed relative to it.
+    pub(crate) fn note_opened(&self) {
+        self.opened_ns.store(clock_ns(), Ordering::Relaxed);
+        self.first_ns.store(0, Ordering::Relaxed);
+        self.last_ns.store(0, Ordering::Relaxed);
+    }
+
+    /// Records the frames left in the ring after a pull, keeping the low-water mark so
+    /// a report can say how close it came to running dry even when it never did.
+    pub(crate) fn note_pull_level(&self, frames: usize) {
+        let frames = frames as u64;
+        let mut low = self.low_water.load(Ordering::Relaxed);
+        while frames < low {
+            match self.low_water.compare_exchange_weak(
+                low,
+                frames,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => low = current,
+            }
+        }
+    }
+
+    /// How long after the stream began the first and last starvation happened, in
+    /// milliseconds, or `None` if the ring never starved.
+    pub(crate) fn span_ms(&self) -> Option<(u64, u64)> {
+        let opened = self.opened_ns.load(Ordering::Relaxed);
+        let first = self.first_ns.load(Ordering::Relaxed);
+        let last = self.last_ns.load(Ordering::Relaxed);
+        if opened == 0 || first == 0 {
+            return None;
+        }
+        Some((
+            first.saturating_sub(opened) / 1_000_000,
+            last.saturating_sub(opened) / 1_000_000,
+        ))
+    }
+
+    /// Takes the counters and restarts the window. `None` when nothing has happened
+    /// since the last call.
+    pub(crate) fn take(&self) -> Option<(u64, u64, u64)> {
+        let count = self.count.swap(0, Ordering::Relaxed);
+        let frames = self.frames.swap(0, Ordering::Relaxed);
+        let low = self.low_water.swap(u64::MAX, Ordering::Relaxed);
+        if count == 0 && low == u64::MAX {
+            return None;
+        }
+        Some((count, frames, if low == u64::MAX { 0 } else { low }))
+    }
+}
 
 /// A monotonic clock in nanoseconds, for placing events relative to each other. Only the
 /// differences matter, so the epoch is irrelevant.
@@ -48,67 +135,6 @@ fn clock_ns() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
-}
-
-/// Records that the ring came up `frames` short of what was asked for.
-pub(crate) fn note_starvation(frames: u64) {
-    STARVATIONS.fetch_add(1, Ordering::Relaxed);
-    STARVED_FRAMES.fetch_add(frames, Ordering::Relaxed);
-    let now = clock_ns();
-    let _ = FIRST_STARVATION_NS.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
-    LAST_STARVATION_NS.store(now, Ordering::Relaxed);
-}
-
-/// Marks the moment a stream began, so a starvation can be placed relative to it.
-pub(crate) fn note_opened() {
-    OPENED_NS.store(clock_ns(), Ordering::Relaxed);
-    FIRST_STARVATION_NS.store(0, Ordering::Relaxed);
-    LAST_STARVATION_NS.store(0, Ordering::Relaxed);
-}
-
-/// How long after the stream began the first and last starvation happened, in
-/// milliseconds, or `None` if the ring never starved.
-pub(crate) fn starvation_span_ms() -> Option<(u64, u64)> {
-    let opened = OPENED_NS.load(Ordering::Relaxed);
-    let first = FIRST_STARVATION_NS.load(Ordering::Relaxed);
-    let last = LAST_STARVATION_NS.load(Ordering::Relaxed);
-    if opened == 0 || first == 0 {
-        return None;
-    }
-    Some((
-        first.saturating_sub(opened) / 1_000_000,
-        last.saturating_sub(opened) / 1_000_000,
-    ))
-}
-
-/// Records the frames left in the ring after a pull, keeping the low-water mark so a
-/// report can say how close it came to running dry even when it never did.
-pub(crate) fn note_pull_level(frames: usize) {
-    let frames = frames as u64;
-    let mut low = LOW_WATER_FRAMES.load(Ordering::Relaxed);
-    while frames < low {
-        match LOW_WATER_FRAMES.compare_exchange_weak(
-            low,
-            frames,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(current) => low = current,
-        }
-    }
-}
-
-/// Takes the counters and restarts the window. `None` when nothing has happened since
-/// the last call.
-pub(crate) fn take_starvation_report() -> Option<(u64, u64, u64)> {
-    let count = STARVATIONS.swap(0, Ordering::Relaxed);
-    let frames = STARVED_FRAMES.swap(0, Ordering::Relaxed);
-    let low = LOW_WATER_FRAMES.swap(u64::MAX, Ordering::Relaxed);
-    if count == 0 && low == u64::MAX {
-        return None;
-    }
-    Some((count, frames, if low == u64::MAX { 0 } else { low }))
 }
 
 /// An interleaved `f32` ring, sized in frames.
@@ -313,7 +339,34 @@ impl Ring {
 
 #[cfg(test)]
 mod tests {
-    use super::Ring;
+    use super::{Ring, Starved};
+
+    #[test]
+    fn two_streams_keep_their_own_starvation_window() {
+        // A game opens more than one PCM, and with these counters in process-wide
+        // statics the second stream's open reset the first stream's window and its
+        // close stole whatever the first had recorded. Each stream owns its own now.
+        let first = Starved::new();
+        let second = Starved::new();
+        first.note_opened();
+        first.note_starvation(480);
+        first.note_starvation(240);
+
+        second.note_opened();
+        second.note_pull_level(512);
+
+        assert_eq!(
+            first.take(),
+            Some((2, 720, 0)),
+            "the first stream's two holes, and nothing from the second"
+        );
+        assert_eq!(first.take(), None, "a window is taken once");
+        assert_eq!(
+            second.take(),
+            Some((0, 0, 512)),
+            "the second stream never starved, and its low water is its own"
+        );
+    }
 
     #[test]
     fn what_goes_in_comes_out_in_order() {

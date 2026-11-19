@@ -99,7 +99,6 @@ fn ring_frames_for(period: u32, buffer: u32) -> u32 {
     credit_frames(period, buffer).clamp(period.max(1), buffer.max(period))
 }
 
-
 /// How the device stream is shared with the rest of the system.
 ///
 /// Shared, which is what the PulseAudio AAudio sink this was measured against uses —
@@ -199,6 +198,12 @@ struct Source {
     /// only deliver silence late. Half an app period is neither: it is a number about the
     /// supplier rather than the consumer.
     wait_ns: Arc<AtomicU64>,
+    /// This stream's starvation counters, which belong to the stream rather than to the
+    /// process: several PCMs are open at once and their counts must not mix.
+    starved: Arc<crate::ring::Starved>,
+    /// The descriptor a waiting writer polls. Signalled here, because a pull is the exact
+    /// moment room appears in the ring.
+    wake: Arc<crate::wake::Wake>,
     /// Whether to count what this pull found. Always.
     ///
     /// These two atomics are the only things that can say the engine spliced silence into
@@ -258,9 +263,16 @@ impl Client for Source {
             if pulled < wanted && since_write < STARVED_AFTER_WRITE_NS {
                 // Nothing may be logged from here — this is the device's audio thread —
                 // so the fact is counted and reported from elsewhere.
-                crate::ring::note_starvation((wanted - pulled) as u64);
+                self.starved.note_starvation((wanted - pulled) as u64);
             }
-            crate::ring::note_pull_level(self.ring.available_frames());
+            self.starved.note_pull_level(self.ring.available_frames());
+        }
+        // Room appeared, so a writer waiting in `snd_pcm_wait` may proceed. Signalled on
+        // every pull that took anything: this is the only event that makes `POLLOUT`
+        // truthful, and a wakeup without a pull would put libasound straight back into its
+        // retry loop.
+        if pulled > 0 {
+            self.wake.signal();
         }
         // What the engine may count as consumed.
         //
@@ -359,6 +371,15 @@ pub struct Pcm {
     dropped_frames: AtomicU64,
     /// Float scratch for the non-float formats, sized at `hw_params`.
     scratch: Mutex<Vec<f32>>,
+    /// This stream's starvation window. Per stream, not per process: a game opens more
+    /// than one PCM, and a summary that mixed them would attribute one stream's dropouts
+    /// to another — and one stream opening would reset a window already in progress.
+    starved: Arc<crate::ring::Starved>,
+    /// The descriptor libasound's `snd_pcm_wait` polls for this PCM. An ioplug that offers
+    /// no poll source leaves libasound polling the PCM's `poll_fd`, which is descriptor
+    /// zero — the process's own stdin — and a stdin pipe at end-of-file turns that wait
+    /// into a spin that never returns. See `crate::wake`.
+    wake: Arc<crate::wake::Wake>,
     /// The device's xrun count, mirrored out of the engine on the write path so the
     /// reporter can read it without taking the lock the audio path needs.
     xruns: Arc<AtomicU32>,
@@ -466,6 +487,8 @@ impl Pcm {
             accepted_frames: AtomicU64::new(0),
             dropped_frames: AtomicU64::new(0),
             scratch: Mutex::new(Vec::new()),
+            starved: Arc::new(crate::ring::Starved::new()),
+            wake: Arc::new(crate::wake::Wake::new()),
             xruns: Arc::new(AtomicU32::new(0)),
             max_step: AtomicU32::new(0),
             last_reported: AtomicU64::new(0),
@@ -616,6 +639,10 @@ impl Pcm {
         match result {
             Ok(()) => {
                 self.running.store(true, Ordering::Release);
+                // The device began consuming, so room will appear; a writer already
+                // waiting should re-read its position now rather than after the first
+                // period.
+                self.wake.signal();
                 trace!(
                     "start: engine running with {} frames queued",
                     self.ring().available_frames()
@@ -837,6 +864,8 @@ pub unsafe extern "C" fn gnaudio_alsa_hw_params(
         ring: ring.clone(),
         last_write_ns: pcm.last_write_ns.clone(),
         wait_ns: pcm.wait_ns.clone(),
+        starved: pcm.starved.clone(),
+        wake: pcm.wake.clone(),
         // Always on: see the field's own note. There is no configuration in which the
         // one measurement that can see a drain-side click should be skipped.
         diagnostics: true,
@@ -857,7 +886,10 @@ pub unsafe extern "C" fn gnaudio_alsa_hw_params(
                 .store(ring_frames.saturating_sub(period_frames), Ordering::Release);
             pcm.base_frames.store(0, Ordering::Release);
             pcm.period_frames.store(period, Ordering::Release);
-            crate::ring::note_opened();
+            pcm.starved.note_opened();
+            // The state changed from "no device" to "a device": a writer already waiting
+            // on this PCM would otherwise sleep through it.
+            pcm.wake.signal();
             // Half a buffer per report: big enough to keep up with playback, small
             // enough that libasound cannot mistake it for a wrapped-around one.
             pcm.avail_frames
@@ -912,6 +944,8 @@ pub unsafe extern "C" fn gnaudio_alsa_hw_free(pcm: *mut Pcm) {
         return;
     };
     pcm.dump.finish();
+    // The device is going: anyone waiting on it must be released rather than left asleep.
+    pcm.wake.signal();
     let taken = pcm.engine().take();
     let mut late_blocks = 0u64;
     if let Some(engine) = taken {
@@ -949,6 +983,8 @@ pub unsafe extern "C" fn gnaudio_alsa_prepare(pcm: *mut Pcm) -> c_int {
         pcm.accepted_frames.store(0, Ordering::Release);
     }
     pcm.ring().clear();
+    // A writer waiting on room is waiting for a state it can no longer reach.
+    pcm.wake.signal();
     trace!("prepare: queue cleared");
     0
 }
@@ -1015,6 +1051,9 @@ pub unsafe extern "C" fn gnaudio_alsa_stop(pcm: *mut Pcm) -> c_int {
         return EINVAL;
     };
     pcm.running.store(false, Ordering::Release);
+    // A stop is a state change a waiting writer has to see: it must not go on waiting for
+    // room that this stream will never make.
+    pcm.wake.signal();
     match pcm.with_engine(|engine| engine.stop()) {
         Some(Ok(())) => {
             trace!("stop: engine stopped at position {}", pcm.position());
@@ -1047,6 +1086,8 @@ pub unsafe extern "C" fn gnaudio_alsa_pause(pcm: *mut Pcm, enable: c_int) -> c_i
             engine.resume()
         }
     });
+    // Both directions change whether room appears, so a waiting writer must look again.
+    pcm.wake.signal();
     match result {
         Some(Ok(())) => {
             trace!("pause: enable={enable}");
@@ -1242,7 +1283,7 @@ fn report_summary(pcm: &Pcm, late_blocks: u64) {
     // Everything below is worth printing on its own. Gating the whole report on the ring
     // having starved once meant the sessions that most needed reading — the clean-looking
     // ones — produced no output at all.
-    let ring = crate::ring::take_starvation_report();
+    let ring = pcm.starved.take();
     let xruns = pcm.xruns.load(Ordering::Acquire);
     let shortfalls = pcm.shortfalls.load(Ordering::Relaxed);
     let short_frames = pcm.short_frames.load(Ordering::Relaxed);
@@ -1261,7 +1302,7 @@ fn report_summary(pcm: &Pcm, late_blocks: u64) {
             "summary: the ring ran dry {count} times, {frames} frames ({:.1} ms) of silence \
              played{}; low water {low} frames; device reports {xruns} xruns",
             frames as f64 * 1000.0 / 48_000.0,
-            match crate::ring::starvation_span_ms() {
+            match pcm.starved.span_ms() {
                 Some((first, last)) => format!(", from {first} ms to {last} ms after start"),
                 None => String::new(),
             }
@@ -1337,7 +1378,7 @@ pub unsafe extern "C" fn gnaudio_alsa_position(pcm: *mut Pcm) -> u64 {
     }
 }
 
-/// Whether a device is open, which the shim reports through `poll`.
+/// Whether a device is open.
 ///
 /// # Safety
 /// `pcm` must be a live handle or null.
@@ -1348,6 +1389,43 @@ pub unsafe extern "C" fn gnaudio_alsa_is_open(pcm: *mut Pcm) -> c_int {
         return 0;
     };
     c_int::from(pcm.with_engine(|_| ()).is_some())
+}
+
+/// The descriptor libasound should poll while a write is waiting for room, or -1 when the
+/// platform would not give this PCM one.
+///
+/// The ioplug's poll callbacks are built on this: without them libasound polls the PCM's
+/// own `poll_fd`, which an ioplug created from a zeroed struct leaves at descriptor zero —
+/// stdin — and a writer waiting on that either spins at full CPU or sleeps out a timeout
+/// per write. `crate::wake` has the whole account.
+///
+/// # Safety
+/// `pcm` must be a live handle or null.
+#[no_mangle]
+pub unsafe extern "C" fn gnaudio_alsa_wait_fd(pcm: *mut Pcm) -> c_int {
+    // SAFETY: `as_ref` is `None` for null.
+    match unsafe { pcm.as_ref() } {
+        Some(pcm) => pcm.wake.fd(),
+        None => -1,
+    }
+}
+
+/// Whether room has appeared since the last call, which is what `poll_revents` reports as
+/// `POLLOUT`.
+///
+/// Answering `POLLOUT` without a pull behind it would be a lie libasound acts on:
+/// `snd_pcm_wait` returns, the write finds `avail` still zero, and it waits again — the
+/// retry loop this exists to avoid.
+///
+/// # Safety
+/// `pcm` must be a live handle or null.
+#[no_mangle]
+pub unsafe extern "C" fn gnaudio_alsa_poll_ready(pcm: *mut Pcm) -> c_int {
+    // SAFETY: `as_ref` is `None` for null.
+    match unsafe { pcm.as_ref() } {
+        Some(pcm) => c_int::from(pcm.wake.fired()),
+        None => 0,
+    }
 }
 
 /// Frame bytes for a format, so the shim can size its byte-based constraints without
@@ -1439,7 +1517,6 @@ mod tests {
         assert!(ring_frames_for(480, 480) >= 480);
     }
 
-    
     #[test]
     fn the_prefill_target_leaves_a_period_of_room() {
         // The game's geometry: a 480 frame period, a 1920 frame buffer, and a ring of three

@@ -9,7 +9,8 @@
 //!
 //! The split in this crate:
 //!
-//! * [`ring`] — the buffer between the app's writes and the device's clock.
+//! * [`ring`] — the buffer between the app's writes and the device's clock, and the
+//!   starvation counters that belong to one stream.
 //! * [`pcm`] — the state, the format conversion, and the C surface the shim calls.
 //! * `shim/gamenative.c` — the ALSA-facing glue: the ioplug struct, the callbacks,
 //!   the hw constraints, and the export macros whose symbol names libasound's own
@@ -25,10 +26,11 @@ mod gap;
 mod log;
 mod pcm;
 mod ring;
+mod wake;
 
 pub use pcm::{
     gnaudio_alsa_create, gnaudio_alsa_destroy, gnaudio_alsa_drain, gnaudio_alsa_frame_bytes,
     gnaudio_alsa_hw_free, gnaudio_alsa_hw_params, gnaudio_alsa_is_open, gnaudio_alsa_pause,
-    gnaudio_alsa_position, gnaudio_alsa_prepare, gnaudio_alsa_start, gnaudio_alsa_stop,
-    gnaudio_alsa_transfer,
+    gnaudio_alsa_poll_ready, gnaudio_alsa_position, gnaudio_alsa_prepare, gnaudio_alsa_start,
+    gnaudio_alsa_stop, gnaudio_alsa_transfer, gnaudio_alsa_wait_fd,
 };
