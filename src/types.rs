@@ -122,10 +122,13 @@ pub struct StreamConfig {
     /// that only offers 44.1 kHz still gets audio at the right pitch rather than a
     /// refusal, because the route is not something either side gets to choose.
     pub sample_rate: Option<i32>,
-    /// Frames the client is handed per callback — its block size. One device burst
-    /// is the granularity: the value is
-    /// rounded up to a whole number of bursts, so a client asking for 256 frames
-    /// on a 128-frame device gets 256 and a callback every other burst.
+    /// Frames the client is handed per callback — its block size.
+    ///
+    /// The device's burst is a floor and nothing more: a client asking for less than one
+    /// burst gets one, because a device cannot be woken more often than that, and any
+    /// other value is passed through as asked. It is deliberately *not* rounded up to a
+    /// whole number of bursts — a block may span several device periods, and rounding
+    /// would make the engine ask the client for more audio than it produces at a time.
     pub block_frames: u32,
     /// Sample format to ask the route for, or `None` for float. A route answers with what
     /// it can take and the engine converts, so this is a request about the route, not about
