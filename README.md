@@ -269,7 +269,9 @@ bursts and the growth rule above. Left off — the default — the stream opens 
 default usage and the route's own buffer.
 
 What remains configurable is the capture, and that is a diagnostic rather than a property of
-the audio path: `GNAUDIO_DUMP_SECONDS` (0 disables) and `GNAUDIO_DUMP_PCM` (path).
+the audio path: `GNAUDIO_DUMP_SECONDS` (seconds to capture; off unless set) and
+`GNAUDIO_DUMP_PCM` (path). Off by default because a capture writes on the caller's thread —
+it perturbs the very path it is measuring — and because nothing removed the files it left.
 
 ## Build and test
 

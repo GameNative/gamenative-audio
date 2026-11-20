@@ -16,11 +16,16 @@
 //! would add work to exactly the path whose lateness is under investigation, which is the
 //! one way a diagnostic can invent the fault it was built to find.
 //!
-//! **On by default**, bounded to the first 20 seconds of a stream, written beside the
-//! image — a diagnostic that needs configuring is a diagnostic that never gets used, and
-//! asking somebody to edit a protobuf container config to answer a question about their
-//! own ears is not a reasonable request. `GNAUDIO_DUMP_PCM` overrides the path and
-//! `GNAUDIO_DUMP_SECONDS=0` turns it off.
+//! **Off unless `GNAUDIO_DUMP_SECONDS` asks for it**, and then bounded to that many
+//! seconds of a stream, written beside the image. `GNAUDIO_DUMP_PCM` overrides the path.
+//!
+//! Off by default because a capture is not free and nothing ever removed one: every
+//! stream open wrote up to 8.4 MB into the app's data directory, named per pid, and a
+//! device that had been used for a few sessions held 66 files and 102 MB of PCM. It also
+//! perturbs what it measures — the caller's thread does the writing — so a build that
+//! ships with it on is a build whose own numbers are taken with a diagnostic running.
+//! A capture is a thing to ask for, in the session under investigation, and that is
+//! exactly the shape of a variable that defaults to off.
 //!
 //! The path is derived from `ALSA_CONFIG_PATH`, which the launcher already sets and which
 //! names `<data-dir>/imagefs/usr/share/alsa/alsa.conf`, so the file lands in the app's own
@@ -52,6 +57,17 @@ const AUDIBLE: f32 = 1.0e-4;
 /// Which capture this is, so several PCMs in one process do not overwrite each other.
 static INSTANCE: AtomicU32 = AtomicU32::new(0);
 
+/// How many seconds to capture, from the variable's own text.
+///
+/// Off when nothing was asked for, and off when what was asked for cannot be read: a
+/// capture is a diagnostic, and a diagnostic that turns itself on because a variable was
+/// misspelled is worse than one that stays quiet.
+fn seconds_from(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 /// Where the capture goes when nobody said: the app's own data directory, derived from the
 /// ALSA configuration path the launcher already sets.
 ///
@@ -76,8 +92,8 @@ fn derive_path() -> Option<String> {
 /// The app's own data directory, or `None` when the launcher gave us no configuration
 /// path to derive it from.
 ///
-/// Shared with the tuning file: both live in the one directory this process can be sure
-/// it may write to, and both derive it the same way, so there is one place to be wrong.
+/// The one directory this process can be sure it may write to, derived rather than
+/// guessed so that a different package name or container root needs no change here.
 pub(crate) fn data_dir() -> Option<std::path::PathBuf> {
     let config = std::env::var("ALSA_CONFIG_PATH").ok()?;
     let first = config.split(':').next()?;
@@ -146,10 +162,7 @@ impl Dump {
         // How long to capture is a diagnostic, not a property of the pipeline, so it is an
         // environment variable and not a tuning file: nothing about the audio path should
         // be settable from a file on the device.
-        let seconds = std::env::var("GNAUDIO_DUMP_SECONDS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(20);
+        let seconds = seconds_from(std::env::var("GNAUDIO_DUMP_SECONDS").ok().as_deref());
         if seconds == 0 {
             return Self::disabled();
         }
@@ -276,7 +289,23 @@ impl Dump {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_path, is_audible};
+    use super::{derive_path, is_audible, seconds_from};
+
+    #[test]
+    fn the_capture_is_off_unless_asked_for() {
+        // The default. An unset variable, an empty one, and one that does not parse all
+        // mean the same thing, and none of them may mean "capture 20 seconds": every
+        // stream open wrote up to 8.4 MB into the app's data directory and nothing
+        // removed it, which left 66 files and 102 MB on one device.
+        assert_eq!(seconds_from(None), 0);
+        assert_eq!(seconds_from(Some("")), 0);
+        assert_eq!(seconds_from(Some("  ")), 0);
+        assert_eq!(seconds_from(Some("yes")), 0);
+        assert_eq!(seconds_from(Some("-5")), 0);
+        // And an explicit request is honoured, from text a caller might actually write.
+        assert_eq!(seconds_from(Some("20")), 20);
+        assert_eq!(seconds_from(Some(" 5 ")), 5);
+    }
 
     #[test]
     fn the_budget_does_not_start_until_there_is_sound() {

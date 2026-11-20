@@ -401,7 +401,8 @@ pub struct Pcm {
     /// here moving.
     shortfalls: AtomicU64,
     short_frames: AtomicU64,
-    /// A capture of what the app hands over, when `GNAUDIO_DUMP_PCM` asks for one.
+    /// A capture of what the app hands over, when `GNAUDIO_DUMP_SECONDS` asks for one;
+    /// `GNAUDIO_DUMP_PCM` overrides where it lands. Off otherwise.
     dump: crate::dump::Dump,
     /// Seams seen in the audio the app handed over: holes and splices that no drain-side
     /// counter can see, because nothing was dropped — the damage arrived already done.
